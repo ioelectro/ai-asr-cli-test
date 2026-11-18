@@ -1,0 +1,19 @@
+# Shenava Koochik FP32 - Live Persian Speech Recognition
+# Python 3.12 recommended
+
+numpy
+scipy
+sounddevice
+webrtcvad-wheels
+
+# Sherpa-ONNX CPU runtime
+sherpa-onnx
+sherpa-onnx-bin
+
+# Model download from Hugging Face
+huggingface-hub
+
+# Terminal UI and Persian RTL display
+rich
+arabic-reshaper
+python-bidi
