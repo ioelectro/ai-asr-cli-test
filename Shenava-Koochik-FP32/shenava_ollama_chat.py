@@ -97,7 +97,7 @@ CPU_THREADS = 4
 INPUT_DEVICE = None
 
 AUDIO_QUEUE_SIZE = 500
-VISIBLE_HISTORY = 10
+VISIBLE_HISTORY = 50
 
 # ============================================================
 
@@ -184,7 +184,7 @@ def make_layout(state, history):
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=3),
-        Layout(name="status", size=5),
+        Layout(name="status", size=6),
         Layout(name="transcript", ratio=1, minimum_size=7),
         Layout(name="footer", size=3),
     )
@@ -192,7 +192,7 @@ def make_layout(state, history):
     header = Text()
     header.append(" SHENAVA ", style="bold bright_cyan")
     header.append("VOICE CHAT", style="bold white")
-    header.append("     KOOCHIK FP32", style="dim")
+    header.append(f"     KOOCHIK FP32  |  {OLLAMA_MODEL}", style="dim")
     layout["header"].update(Panel(Align.center(header), box=box.DOUBLE,
                                   border_style="cyan", padding=(0, 1)))
 
@@ -207,6 +207,9 @@ def make_layout(state, history):
     calibration_text = (f"ACTIVE  ({state['threshold']:.4f})" if state["calibrated"]
                         else f"DISABLED ({state['threshold']:.4f})")
     status_table.add_row("VAD", "WebRTC", "CALIBRATION", calibration_text)
+    ai_state = state.get("ai_status", "Idle")
+    ai_style = "bold cyan" if state.get("ai_busy") else "dim"
+    status_table.add_row("AI", Text(ai_state, style=ai_style), "MODEL", OLLAMA_MODEL)
     layout["status"].update(Panel(status_table, title="[bold cyan]SYSTEM STATUS[/bold cyan]",
                                   border_style="cyan", box=box.ROUNDED))
 
@@ -232,11 +235,20 @@ def make_layout(state, history):
                                     drop_whitespace=True) or [""]
             for line in wrapped:
                 transcript_lines.append((rtl(line), "bold bright_white", True))
+    if state.get("ai_busy"):
+        transcript_lines.append(("  QWEN STREAMING", "bold bright_cyan", False))
+        stream_text = state.get("stream_text", "") or "در انتظار اولین بخش پاسخ..."
+        for paragraph in stream_text.splitlines() or [""]:
+            wrapped = textwrap.wrap(paragraph, width=width, break_long_words=True,
+                                    break_on_hyphens=False, replace_whitespace=False,
+                                    drop_whitespace=True) or [""]
+            for line in wrapped:
+                transcript_lines.append((rtl(line), "bright_white", True))
     elif not transcript_lines:
         transcript_lines.append((rtl("هنوز گفتاری ثبت نشده است."), "dim", True))
 
     # Account for the transcript panel border and its vertical padding.
-    viewport = max(1, console.height - 15)
+    viewport = max(1, console.height - 16)
     max_offset = max(0, len(transcript_lines) - viewport)
     offset = min(max(0, state.get("scroll_offset", 0)), max_offset)
     state["scroll_offset"] = offset
@@ -704,27 +716,24 @@ def asr_worker(recognizer, input_rate):
 # ============================================================
 
 def ollama_worker():
-
+    """Send chat turns to Ollama and forward incremental NDJSON chunks."""
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     while True:
-
         user_text = chat_queue.get()
-
         if user_text is None:
             break
 
         messages.append({"role": "user", "content": user_text})
-
         payload = {
             "model": OLLAMA_MODEL,
             "messages": messages,
-            "stream": False,
-            "options": {
-                "temperature": 0.4,
-                "num_ctx": 4096,
-            },
+            "stream": True,
+            "options": {"temperature": 0.4, "num_ctx": 4096},
         }
+        answer_parts = []
+        started = time.monotonic()
+        chunk_count = 0
 
         try:
             request = urllib.request.Request(
@@ -733,51 +742,81 @@ def ollama_worker():
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
+            chat_result_queue.put(("start", None))
+            with urllib.request.urlopen(request, timeout=OLLAMA_TIMEOUT) as response:
+                for raw_line in response:
+                    if not raw_line.strip():
+                        continue
+                    packet = json.loads(raw_line.decode("utf-8"))
+                    piece = packet.get("message", {}).get("content", "")
+                    if piece:
+                        answer_parts.append(piece)
+                        chunk_count += 1
+                        elapsed = max(0.001, time.monotonic() - started)
+                        chat_result_queue.put(("chunk", (piece, chunk_count, elapsed)))
+                    if packet.get("error"):
+                        raise RuntimeError(packet["error"])
+                    if packet.get("done"):
+                        break
 
-            with urllib.request.urlopen(
-                request,
-                timeout=OLLAMA_TIMEOUT,
-            ) as response:
-                result = json.loads(response.read().decode("utf-8"))
-
-            answer = result.get("message", {}).get("content", "").strip()
-
+            answer = "".join(answer_parts).strip()
             if not answer:
                 raise RuntimeError("Ollama returned an empty response.")
 
             messages.append({"role": "assistant", "content": answer})
-
-            # Keep context bounded while preserving the system prompt.
             if len(messages) > 21:
                 messages = [messages[0]] + messages[-20:]
 
-            chat_result_queue.put(("ok", answer))
+            elapsed = max(0.001, time.monotonic() - started)
+            chat_result_queue.put(("done", (answer, chunk_count, elapsed)))
 
         except Exception as error:
-            # Remove the unanswered user message so the next turn stays valid.
             if messages and messages[-1].get("role") == "user":
                 messages.pop()
             chat_result_queue.put(("error", str(error)))
 
 
 def process_chat_results(state, history):
-
+    changed = False
     while True:
         try:
             kind, value = chat_result_queue.get_nowait()
         except queue.Empty:
             break
 
-        timestamp = datetime.now().strftime("%H:%M:%S")
+        changed = True
+        if kind == "start":
+            state["ai_busy"] = True
+            state["ai_status"] = "Generating response..."
+            state["stream_text"] = ""
+            state["stream_chunks"] = 0
+            state["stream_started"] = time.monotonic()
 
-        if kind == "ok":
-            history.append((timestamp, f"Qwen: {value}"))
-            state["status"] = "Listening"
-            state["message"] = ""
-        else:
+        elif kind == "chunk":
+            piece, chunk_count, elapsed = value
+            state["stream_text"] += piece
+            state["stream_chunks"] = chunk_count
+            rate = chunk_count / max(elapsed, 0.001)
+            state["ai_status"] = f"Streaming | {rate:.1f} chunks/s | {elapsed:.1f}s"
+
+        elif kind == "done":
+            answer, chunk_count, elapsed = value
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            history.append((timestamp, f"Qwen: {answer}"))
+            state["ai_busy"] = False
+            state["ai_status"] = f"Completed | {elapsed:.1f}s | {chunk_count} chunks"
+            state["stream_text"] = ""
+            state["scroll_offset"] = 0
+
+        elif kind == "error":
+            timestamp = datetime.now().strftime("%H:%M:%S")
             history.append((timestamp, f"خطای Ollama: {value}"))
-            state["status"] = "Ollama error"
+            state["ai_busy"] = False
+            state["ai_status"] = "Ollama error"
+            state["stream_text"] = ""
             state["message"] = value
+
+    return changed
 
 
 # ============================================================
@@ -836,6 +875,9 @@ def process_results(state, history):
 
                 # Send each finalized utterance to Ollama as one chat turn.
                 chat_queue.put(text)
+                state["ai_busy"] = True
+                state["ai_status"] = "Queued / waiting for Ollama"
+                state["stream_text"] = ""
 
                 state["last_rtf"] = (
                     elapsed / duration if duration else 0
@@ -976,6 +1018,10 @@ def main():
         "last_rtf": 0.0,
         "last_inference": 0.0,
         "scroll_offset": 0,
+        "ai_busy": False,
+        "ai_status": "Idle",
+        "stream_text": "",
+        "stream_chunks": 0,
     }
 
     worker = threading.Thread(
@@ -1071,6 +1117,9 @@ def main():
                             history,
                         )
                         process_chat_results(state, history)
+                        if state.get("ai_busy") and not state.get("stream_chunks"):
+                            waited = time.monotonic() - state.get("stream_started", time.monotonic())
+                            state["ai_status"] = f"Waiting for first token | {waited:.1f}s"
 
                         key = read_key()
 
