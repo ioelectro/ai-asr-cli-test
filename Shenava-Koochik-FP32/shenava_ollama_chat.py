@@ -182,7 +182,6 @@ def rtl_renderable(text, style="white", width=None):
 def make_layout(state, history):
 
     layout = Layout()
-
     layout.split_column(
         Layout(name="header", size=3),
         Layout(name="status", size=5),
@@ -190,146 +189,81 @@ def make_layout(state, history):
         Layout(name="footer", size=3),
     )
 
-    # Header
     header = Text()
     header.append(" SHENAVA ", style="bold bright_cyan")
     header.append("VOICE CHAT", style="bold white")
     header.append("     KOOCHIK FP32", style="dim")
+    layout["header"].update(Panel(Align.center(header), box=box.DOUBLE,
+                                  border_style="cyan", padding=(0, 1)))
 
-    layout["header"].update(
-        Panel(
-            Align.center(header),
-            box=box.DOUBLE,
-            border_style="cyan",
-            padding=(0, 1),
-        )
-    )
-
-    # Status
     status_table = Table.grid(padding=(0, 2))
     status_table.add_column(style="dim")
     status_table.add_column(style="bold white")
     status_table.add_column(style="dim")
     status_table.add_column(style="bold cyan")
+    status_style = "bold green" if state["status"] == "Listening" else "bold yellow"
+    status_table.add_row("STATUS", Text(state["status"], style=status_style),
+                         "MICROPHONE", state["device"])
+    calibration_text = (f"ACTIVE  ({state['threshold']:.4f})" if state["calibrated"]
+                        else f"DISABLED ({state['threshold']:.4f})")
+    status_table.add_row("VAD", "WebRTC", "CALIBRATION", calibration_text)
+    layout["status"].update(Panel(status_table, title="[bold cyan]SYSTEM STATUS[/bold cyan]",
+                                  border_style="cyan", box=box.ROUNDED))
 
-    status_style = (
-        "bold green"
-        if state["status"] == "Listening"
-        else "bold yellow"
-    )
+    # Build a physical-line buffer first. Scroll offset is measured from the
+    # bottom: 0 means follow newest messages; positive values show older lines.
+    width = max(12, console.width - 8)
+    transcript_lines = []
+    for timestamp, message in history:
+        transcript_lines.append((f"  {timestamp}", "dim", False))
+        for paragraph in str(message).splitlines() or [""]:
+            wrapped = textwrap.wrap(paragraph, width=width, break_long_words=True,
+                                    break_on_hyphens=False, replace_whitespace=False,
+                                    drop_whitespace=True) or [""]
+            for line in wrapped:
+                transcript_lines.append((rtl(line), "white", True))
 
-    status_table.add_row(
-        "STATUS",
-        Text(state["status"], style=status_style),
-        "MICROPHONE",
-        state["device"],
-    )
-
-    calibration_text = (
-        f"ACTIVE  ({state['threshold']:.4f})"
-        if state["calibrated"]
-        else f"DISABLED ({state['threshold']:.4f})"
-    )
-
-    status_table.add_row(
-        "VAD",
-        "WebRTC",
-        "CALIBRATION",
-        calibration_text,
-    )
-
-    layout["status"].update(
-        Panel(
-            status_table,
-            title="[bold cyan]SYSTEM STATUS[/bold cyan]",
-            border_style="cyan",
-            box=box.ROUNDED,
-        )
-    )
-
-    # Transcript window
-    transcript_items = []
-
-    if history:
-
-        for timestamp, text in history:
-
-            transcript_items.append(
-                Text(
-                    f"  {timestamp}",
-                    style="dim",
-                )
-            )
-
-            transcript_items.append(
-                rtl_renderable(text, style="white")
-            )
-
-    # Current partial transcription
     if state["speaking"]:
+        transcript_lines.append(("  LIVE PREVIEW", "bold yellow", False))
+        preview = state["partial_text"] or "در حال شنیدن گفتار..."
+        for paragraph in preview.splitlines() or [""]:
+            wrapped = textwrap.wrap(paragraph, width=width, break_long_words=True,
+                                    break_on_hyphens=False, replace_whitespace=False,
+                                    drop_whitespace=True) or [""]
+            for line in wrapped:
+                transcript_lines.append((rtl(line), "bold bright_white", True))
+    elif not transcript_lines:
+        transcript_lines.append((rtl("هنوز گفتاری ثبت نشده است."), "dim", True))
 
-        transcript_items.append(
-            Text(
-                "  LIVE PREVIEW",
-                style="bold yellow",
-            )
-        )
+    # Account for the transcript panel border and its vertical padding.
+    viewport = max(1, console.height - 15)
+    max_offset = max(0, len(transcript_lines) - viewport)
+    offset = min(max(0, state.get("scroll_offset", 0)), max_offset)
+    state["scroll_offset"] = offset
+    end = len(transcript_lines) - offset
+    begin = max(0, end - viewport)
+    visible_lines = transcript_lines[begin:end]
 
-        if state["partial_text"]:
+    renderables = []
+    for line, style, is_rtl in visible_lines:
+        item = Text(line, style=style, no_wrap=True, overflow="crop")
+        renderables.append(Align.right(item, pad=True) if is_rtl else item)
 
-            transcript_items.append(
-                rtl_renderable(
-                    state["partial_text"],
-                    style="bold bright_white",
-                )
-            )
-
-        else:
-
-            transcript_items.append(
-                rtl_renderable("در حال شنیدن گفتار...", style="dim")
-            )
-
-    elif not history:
-
-        transcript_items.append(
-            Align.center(
-                Text(
-                    rtl("هنوز گفتاری ثبت نشده است."),
-                    style="dim",
-                )
-            )
-        )
-
-    transcript_group = Group(*transcript_items)
-
-    layout["transcript"].update(
-        Panel(
-            transcript_group,
-            title="[bold green]TRANSCRIPT[/bold green]",
-            subtitle="[dim]Live text preview and recognized sentences[/dim]",
-            border_style="green",
-            box=box.ROUNDED,
-            padding=(1, 2),
-        )
+    scroll_label = "LIVE" if offset == 0 else f"SCROLL: {offset} lines up"
+    transcript_panel = Panel(
+        Group(*renderables),
+        title="[bold green]TRANSCRIPT[/bold green]",
+        subtitle=f"[dim]{scroll_label} | ↑/↓: scroll | PgUp/PgDn: page | End: latest[/dim]",
+        border_style="green", box=box.ROUNDED, padding=(1, 2),
     )
+    layout["transcript"].update(transcript_panel)
 
-    # Footer
     footer = Text(
-        " Speak to chat with Qwen     C  Recalibrate     D  Disable calibration     Q  Quit",
-        style="bold white",
-        justify="center",
+        " Speak to chat with Qwen     ↑/↓ Scroll     PgUp/PgDn Page     End Latest     C Recalibrate     D Disable calibration     Q Quit",
+        style="bold white", justify="center",
     )
-
-    layout["footer"].update(
-        Panel(
-            footer,
-            border_style="blue",
-            box=box.ROUNDED,
-            padding=(0, 1),
-        )
-    )
-
+    layout["footer"].update(Panel(footer, border_style="blue", box=box.ROUNDED,
+                                  padding=(0, 1)))
     return layout
 
 
@@ -922,20 +856,38 @@ def process_results(state, history):
 # ============================================================
 
 def read_key():
-
+    """Read normal keys and common terminal navigation keys."""
     if not sys.stdin.isatty():
         return None
 
-    ready, _, _ = select.select(
-        [sys.stdin],
-        [],
-        [],
-        0,
-    )
+    ready, _, _ = select.select([sys.stdin], [], [], 0)
+    if not ready:
+        return None
 
-    if ready:
-        return sys.stdin.read(1).lower()
+    ch = sys.stdin.read(1)
+    if ch != "\x1b":
+        return ch.lower()
 
+    # Arrow / PageUp / PageDown / End escape sequence.
+    sequence = ch
+    for _ in range(5):
+        ready, _, _ = select.select([sys.stdin], [], [], 0.015)
+        if not ready:
+            break
+        sequence += sys.stdin.read(1)
+        if sequence.endswith(("A", "B", "H", "F", "~")):
+            if sequence.endswith("[A"):
+                return "up"
+            if sequence.endswith("[B"):
+                return "down"
+            if sequence.endswith("[5~"):
+                return "pageup"
+            if sequence.endswith("[6~"):
+                return "pagedown"
+            if sequence.endswith("[F") or sequence.endswith("[4~"):
+                return "end"
+            if sequence.endswith("[H") or sequence.endswith("[1~"):
+                return "home"
     return None
 
 
@@ -1023,6 +975,7 @@ def main():
         "message": "",
         "last_rtf": 0.0,
         "last_inference": 0.0,
+        "scroll_offset": 0,
     }
 
     worker = threading.Thread(
@@ -1120,6 +1073,20 @@ def main():
                         process_chat_results(state, history)
 
                         key = read_key()
+
+                        # Transcript navigation (offset 0 follows newest messages).
+                        if key in ("up", "k"):
+                            state["scroll_offset"] += 1
+                        elif key in ("down", "j"):
+                            state["scroll_offset"] = max(0, state["scroll_offset"] - 1)
+                        elif key == "pageup":
+                            state["scroll_offset"] += max(1, console.height - 18)
+                        elif key == "pagedown":
+                            state["scroll_offset"] = max(0, state["scroll_offset"] - max(1, console.height - 18))
+                        elif key in ("end", "g"):
+                            state["scroll_offset"] = 0
+                        elif key == "home":
+                            state["scroll_offset"] = 10**9
 
                         # Recalibrate
                         if key == "c":
