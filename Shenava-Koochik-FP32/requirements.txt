@@ -1,9 +1,12 @@
 # Shenava Koochik FP32 - Live Persian Speech Recognition
 # Python 3.12 recommended
 
+# Audio processing
 numpy
 scipy
 sounddevice
+
+# Voice Activity Detection
 webrtcvad-wheels
 
 # Sherpa-ONNX CPU runtime
@@ -17,3 +20,6 @@ huggingface-hub
 rich
 arabic-reshaper
 python-bidi
+
+# Offline Neural Text-to-Speech
+piper-tts
