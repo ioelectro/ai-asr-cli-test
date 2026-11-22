@@ -1,2 +1,0 @@
-# Windows may need the IANA timezone database for zoneinfo.
-tzdata; platform_system == "Windows"
