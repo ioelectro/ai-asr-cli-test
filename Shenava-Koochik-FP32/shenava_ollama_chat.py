@@ -14,6 +14,7 @@ import json
 import textwrap
 import urllib.request
 import urllib.error
+import socket
 
 from pathlib import Path
 from collections import deque
@@ -50,7 +51,7 @@ MODEL_ID = "Reza2kn/Shenava-Koochik-v1.0-sherpa-onnx"
 # Ollama chat API
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
 OLLAMA_MODEL = "qwen3:4b-instruct"
-OLLAMA_TIMEOUT = 120
+OLLAMA_TIMEOUT = 300  # Allow Qwen to load and start generating on CPU
 SYSTEM_PROMPT = (
     "تو یک دستیار فارسی‌زبان هستی. طبیعی، دقیق و کوتاه پاسخ بده. "
     "به زبان کاربر پاسخ بده و اگر چیزی را نمی‌دانی صادقانه بگو."
@@ -108,6 +109,7 @@ asr_queue = queue.Queue()
 result_queue = queue.Queue()
 chat_queue = queue.Queue()
 chat_result_queue = queue.Queue()
+cancel_event = threading.Event()
 
 audio_dropped = [0]
 
@@ -271,7 +273,7 @@ def make_layout(state, history):
     layout["transcript"].update(transcript_panel)
 
     footer = Text(
-        " Speak to chat with Qwen     ↑/↓ Scroll     PgUp/PgDn Page     End Latest     C Recalibrate     D Disable calibration     Q Quit",
+        " Speak to chat with Qwen     X / ESC Cancel AI     ↑/↓ Scroll     PgUp/PgDn Page     C Recalibrate     D Disable     Q Quit",
         style="bold white", justify="center",
     )
     layout["footer"].update(Panel(footer, border_style="blue", box=box.ROUNDED,
@@ -716,7 +718,7 @@ def asr_worker(recognizer, input_rate):
 # ============================================================
 
 def ollama_worker():
-    """Send chat turns to Ollama and forward incremental NDJSON chunks."""
+    """Run one Ollama request at a time and stream chunks; supports cancellation."""
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     while True:
@@ -724,16 +726,17 @@ def ollama_worker():
         if user_text is None:
             break
 
-        messages.append({"role": "user", "content": user_text})
+        request_messages = messages + [{"role": "user", "content": user_text}]
         payload = {
             "model": OLLAMA_MODEL,
-            "messages": messages,
+            "messages": request_messages,
             "stream": True,
             "options": {"temperature": 0.4, "num_ctx": 4096},
         }
         answer_parts = []
         started = time.monotonic()
         chunk_count = 0
+        cancelled = False
 
         try:
             request = urllib.request.Request(
@@ -744,7 +747,13 @@ def ollama_worker():
             )
             chat_result_queue.put(("start", None))
             with urllib.request.urlopen(request, timeout=OLLAMA_TIMEOUT) as response:
-                for raw_line in response:
+                while not cancel_event.is_set():
+                    try:
+                        raw_line = response.readline()
+                    except socket.timeout:
+                        continue
+                    if not raw_line:
+                        break
                     if not raw_line.strip():
                         continue
                     packet = json.loads(raw_line.decode("utf-8"))
@@ -759,11 +768,16 @@ def ollama_worker():
                     if packet.get("done"):
                         break
 
+            cancelled = cancel_event.is_set()
+            if cancelled:
+                chat_result_queue.put(("cancelled", "پاسخ هوش مصنوعی توسط کاربر لغو شد."))
+                continue
+
             answer = "".join(answer_parts).strip()
             if not answer:
                 raise RuntimeError("Ollama returned an empty response.")
 
-            messages.append({"role": "assistant", "content": answer})
+            messages = request_messages + [{"role": "assistant", "content": answer}]
             if len(messages) > 21:
                 messages = [messages[0]] + messages[-20:]
 
@@ -771,9 +785,10 @@ def ollama_worker():
             chat_result_queue.put(("done", (answer, chunk_count, elapsed)))
 
         except Exception as error:
-            if messages and messages[-1].get("role") == "user":
-                messages.pop()
-            chat_result_queue.put(("error", str(error)))
+            if cancel_event.is_set():
+                chat_result_queue.put(("cancelled", "پاسخ هوش مصنوعی توسط کاربر لغو شد."))
+            else:
+                chat_result_queue.put(("error", str(error)))
 
 
 def process_chat_results(state, history):
@@ -806,6 +821,15 @@ def process_chat_results(state, history):
             state["ai_busy"] = False
             state["ai_status"] = f"Completed | {elapsed:.1f}s | {chunk_count} chunks"
             state["stream_text"] = ""
+            state["scroll_offset"] = 0
+
+        elif kind == "cancelled":
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            history.append((timestamp, value))
+            state["ai_busy"] = False
+            state["ai_status"] = "Cancelled"
+            state["stream_text"] = ""
+            state["stream_chunks"] = 0
             state["scroll_offset"] = 0
 
         elif kind == "error":
@@ -873,11 +897,19 @@ def process_results(state, history):
                     (timestamp, f"شما: {text}")
                 )
 
-                # Send each finalized utterance to Ollama as one chat turn.
-                chat_queue.put(text)
-                state["ai_busy"] = True
-                state["ai_status"] = "Queued / waiting for Ollama"
-                state["stream_text"] = ""
+                # Accept only one user turn at a time. Speech recognized while
+                # Qwen is busy is shown in the transcript but is not queued.
+                if state.get("ai_busy"):
+                    state["ai_status"] = "Busy - wait for Qwen or press X to cancel"
+                    history.append((timestamp, "سیستم: تا پایان پاسخ فعلی، پرسش جدید پذیرفته نمی‌شود."))
+                else:
+                    cancel_event.clear()
+                    state["ai_busy"] = True
+                    state["ai_status"] = "Queued / waiting for Ollama"
+                    state["stream_text"] = ""
+                    state["stream_chunks"] = 0
+                    state["stream_started"] = time.monotonic()
+                    chat_queue.put(text)
 
                 state["last_rtf"] = (
                     elapsed / duration if duration else 0
@@ -915,6 +947,8 @@ def read_key():
     for _ in range(5):
         ready, _, _ = select.select([sys.stdin], [], [], 0.015)
         if not ready:
+            if sequence == "\x1b":
+                return "esc"
             break
         sequence += sys.stdin.read(1)
         if sequence.endswith(("A", "B", "H", "F", "~")):
@@ -1123,6 +1157,11 @@ def main():
 
                         key = read_key()
 
+                        # Cancel the active Ollama generation without stopping Shenava.
+                        if key in ("x", "esc") and state.get("ai_busy"):
+                            cancel_event.set()
+                            state["ai_status"] = "Cancelling..."
+
                         # Transcript navigation (offset 0 follows newest messages).
                         if key in ("up", "k"):
                             state["scroll_offset"] += 1
@@ -1275,9 +1314,10 @@ def main():
 
                 process_results(state, history)
 
-                # Finish all pending Ollama requests before exiting.
+                # Stop an active generation before shutting down the chat worker.
+                cancel_event.set()
                 chat_queue.put(None)
-                chat_worker.join()
+                chat_worker.join(timeout=3.0)
                 process_chat_results(state, history)
 
                 state["status"] = "Stopped"
