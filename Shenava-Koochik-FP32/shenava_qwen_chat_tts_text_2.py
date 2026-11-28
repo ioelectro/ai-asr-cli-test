@@ -127,6 +127,7 @@ TTS_STREAMING_ENABLED = False
 tts_result_queue = queue.Queue()
 cancel_event = threading.Event()
 tts_playing = threading.Event()
+mic_paused = threading.Event()
 audio_dropped = [0]
 audio_status = [""]
 
@@ -193,11 +194,6 @@ def clean_model_output(value, streaming=False):
 def ltr(value):
     """Keep timestamps and numeric labels left-to-right."""
     return "\u200e" + str(value)
-
-
-def model_display_name():
-    """Return the actual Ollama model ID for the English UI."""
-    return OLLAMA_MODEL
 
 
 def cell_width(value):
@@ -267,57 +263,22 @@ def make_layout(state, history):
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=3),
-        Layout(name="status", size=8),
         Layout(name="transcript", ratio=1, minimum_size=7),
         Layout(name="input", size=3),
-        Layout(name="footer", size=3),
+        Layout(name="footer", size=2),
     )
 
     header = Text()
     header.append(" SHENAVA ", style="bold bright_cyan")
     header.append("VOICE + TEXT CHAT", style="bold white")
-    header.append(f"     KOOCHIK FP32 | {model_display_name()}", style="dim")
+    status = state.get("status", "Listening").upper()
+    header.append(f"     {status}", style="bold green" if status == "LISTENING" else "bold yellow")
     layout["header"].update(
         Panel(Align.center(header), box=box.DOUBLE,
               border_style="cyan", padding=(0, 1))
     )
 
-    table = Table.grid(padding=(0, 2))
-    table.add_column(style="dim")
-    table.add_column(style="bold white")
-    table.add_column(style="dim")
-    table.add_column(style="bold cyan")
-
-    status_style = "bold green" if state["status"] == "Listening" else "bold yellow"
-    table.add_row("STATUS", Text(state["status"], style=status_style),
-                  "MICROPHONE", state["device"])
-    calibration = (
-        f"ACTIVE ({state['threshold']:.4f})"
-        if state["calibrated"] else f"DISABLED ({state['threshold']:.4f})"
-    )
-    table.add_row("VAD", f"WebRTC mode {VAD_MODE}", "CALIBRATION", calibration)
-    table.add_row(
-        "NOISE", f"{state.get('noise_floor', 0.0):.4f} RMS | Drop {audio_dropped[0]}",
-        "ENDPOINT", f"{state.get('silence_ms', 0)} / {END_SILENCE_MS} ms",
-    )
-
-    ai_style = "bold cyan" if state["ai_busy"] else "dim"
-    table.add_row("AI", Text(state["ai_status"], style=ai_style),
-                  "MODEL", model_display_name())
-
-    tts_state = state["tts_status"]
-    tts_style = (
-        "bold green" if tts_state == "Speaking" or tts_state.startswith("Ready")
-        else ("dim" if tts_state == "Disabled" else "bold yellow")
-    )
-    table.add_row("TTS", Text(tts_state, style=tts_style),
-                  "VOICE", "Ganji Medium")
-    layout["status"].update(
-        Panel(table, title="[bold cyan]SYSTEM STATUS[/bold cyan]",
-              border_style="cyan", box=box.ROUNDED)
-    )
-
-    # Keep Persian text untouched so the terminal handles BiDi rendering.
+    # Only completed turns appear here; partial ASR and token streams stay hidden.
     width = max(12, console.width - 10)
     transcript = []
 
@@ -326,21 +287,10 @@ def make_layout(state, history):
         # The model ID is part of the first response line, not a separate row.
         append_rtl_lines(transcript, message, width, "white")
 
-    if state["speaking"]:
-        transcript.append((ltr("LIVE PREVIEW"), "bold yellow", False))
-        preview = state["partial_text"] or "در حال شنیدن گفتار..."
-        append_rtl_lines(transcript, preview, width, "bold bright_white")
-
-    if state["ai_busy"]:
-        stream = state["stream_text"] or "در انتظار پاسخ..."
-        append_rtl_lines(
-            transcript, f"Qwen: {stream}", width, "bright_white"
-        )
-
     if not transcript:
-        transcript.append((rtl("هنوز پیامی ثبت نشده است."), "dim", True))
+        transcript.append((ltr("Start speaking or type a message."), "dim", False))
 
-    viewport = max(1, console.height - 21)
+    viewport = max(1, console.height - 12)
     max_offset = max(0, len(transcript) - viewport)
     offset = min(max(0, state["scroll_offset"]), max_offset)
     state["scroll_offset"] = offset
@@ -355,19 +305,14 @@ def make_layout(state, history):
             no_wrap=False, overflow="fold",
         )
         # Timestamps stay on the left; Persian messages stay on the right.
-        if is_rtl == "right_ltr":
-            rendered.append(Align.right(item, pad=True))
-        else:
-            rendered.append(
-                Align.right(item, pad=True) if is_rtl else Align.left(item, pad=True)
-            )
+        rendered.append(
+            Align.right(item, pad=True) if is_rtl else Align.left(item, pad=True)
+        )
 
-    scroll_label = "LIVE" if offset == 0 else f"SCROLL: {offset}"
     layout["transcript"].update(
         Panel(
             Group(*rendered),
-            title="[bold green]TRANSCRIPT[/bold green]",
-            subtitle=f"[dim]{scroll_label} | ↑/↓ scroll | PgUp/PgDn page | End latest[/dim]",
+            title="[bold green]CHAT[/bold green]",
             border_style="green", box=box.ROUNDED, padding=(1, 2),
         )
     )
@@ -382,14 +327,13 @@ def make_layout(state, history):
     layout["input"].update(
         Panel(
             rtl_renderable(prompt + "  ", width=max(10, console.width - 10)),
-            title="[bold cyan]TEXT INPUT[/bold cyan]",
+            title="[bold cyan]MESSAGE[/bold cyan]",
             border_style="cyan", padding=(0, 1),
         )
     )
 
     footer = Text(
-        f"Silence {END_SILENCE_MS}ms | ENTER Send | BACKSPACE Delete | CTRL+U Clear | ESC Cancel | "
-        "↑/↓ Scroll | ←/→ Cursor | Home/End | C Calibrate | D Disable | Q Quit",
+        "ENTER Send | ↑/↓ Scroll | ←/→ Edit | ESC Cancel | Q Quit",
         style="bold white", justify="center",
     )
     layout["footer"].update(
@@ -481,10 +425,10 @@ def prepare_asr_audio(audio):
 
 
 def audio_callback(indata, frames, time_info, status):
-    # Ignore microphone input while Piper is speaking.
+    # Freeze microphone capture for the complete assistant turn.
     if status:
         audio_status[0] = str(status)
-    if tts_playing.is_set():
+    if mic_paused.is_set() or tts_playing.is_set():
         return
 
     block = indata[:, 0].copy()
@@ -506,6 +450,15 @@ def clear_audio_queue():
     while True:
         try:
             audio_queue.get_nowait()
+        except queue.Empty:
+            break
+
+
+def clear_tts_queue():
+    """Drop queued speech that belongs to an interrupted assistant turn."""
+    while True:
+        try:
+            tts_queue.get_nowait()
         except queue.Empty:
             break
 
@@ -638,9 +591,16 @@ def play_tts_audio(audio, sample_rate):
 
 def tts_worker(voice):
     while True:
-        text = tts_queue.get()
-        if text is None:
+        task = tts_queue.get()
+        if task is None:
             break
+
+        # This marker is queued after the final phrase; it confirms playback ended.
+        if isinstance(task, tuple) and task[0] == "response_end":
+            tts_result_queue.put(("response_done", task[1]))
+            continue
+
+        text = task
 
         text = clean_text_for_tts(text)
         if not text:
@@ -692,14 +652,32 @@ def process_tts_results(state, history):
             break
 
         if kind == "status":
-            state["tts_status"] = value
+            if value == "Speaking":
+                state["status"] = "Speaking"
         elif kind == "done":
-            state["tts_status"] = (
-                f"Ready | {value['channels']}ch | {value['duration']:.1f}s"
-            )
+            pass
+        elif kind == "response_done":
+            state["tts_completed_turn"] = value
+            finish_turn_if_ready(state, value)
         else:
-            state["tts_status"] = "Playback error"
-            history.append((datetime.now().strftime("%H:%M:%S"), f"TTS error: {value}"))
+            # Keep the chat clean; expose playback failure only in the status state.
+            state["message"] = str(value)
+
+
+def finish_turn_if_ready(state, turn_id):
+    """Resume microphone only after Qwen and the final Piper audio both finish."""
+    if turn_id != state.get("turn_id") or not state.get("assistant_done"):
+        return
+    if state.get("tts_enabled") and state.get("tts_completed_turn") != turn_id:
+        state["waiting_for_tts"] = True
+        state["status"] = "Speaking"
+        return
+
+    state["waiting_for_tts"] = False
+    state["ai_busy"] = False
+    state["status"] = "Listening"
+    mic_paused.clear()
+    clear_audio_queue()
 
 
 # ============================================================
@@ -964,9 +942,14 @@ def ollama_worker():
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     while True:
-        user_text = chat_queue.get()
-        if user_text is None:
+        task = chat_queue.get()
+        if task is None:
             break
+
+        if isinstance(task, tuple):
+            user_text, turn_id = task
+        else:
+            user_text, turn_id = task, 0
 
         request_messages = messages + [{"role": "user", "content": user_text}]
         payload = {
@@ -988,8 +971,6 @@ def ollama_worker():
                 headers={"Content-Type": "application/json", "Accept": "application/x-ndjson"},
                 method="POST",
             )
-            chat_result_queue.put(("start", None))
-
             with OLLAMA_OPENER.open(request, timeout=OLLAMA_TIMEOUT) as response:
                 while not cancel_event.is_set():
                     if time.monotonic() - started > OLLAMA_TIMEOUT:
@@ -1009,10 +990,6 @@ def ollama_worker():
                     if piece:
                         parts.append(piece)
                         chunks += 1
-                        chat_result_queue.put((
-                            "chunk",
-                            (piece, chunks, time.monotonic() - started),
-                        ))
                         # Start Piper while Qwen is still generating its answer.
                         if TTS_STREAMING_ENABLED and not cancel_event.is_set():
                             for phrase in speech_buffer.feed(piece):
@@ -1024,7 +1001,10 @@ def ollama_worker():
                         break
 
             if cancel_event.is_set():
-                chat_result_queue.put(("cancelled", "پاسخ هوش مصنوعی لغو شد."))
+                if TTS_STREAMING_ENABLED:
+                    clear_tts_queue()
+                    tts_queue.put(("response_end", turn_id))
+                chat_result_queue.put(("cancelled", turn_id))
                 continue
 
             answer = clean_model_output("".join(parts)).strip()
@@ -1034,6 +1014,7 @@ def ollama_worker():
             if TTS_STREAMING_ENABLED:
                 for phrase in speech_buffer.feed(final=True):
                     tts_queue.put(phrase)
+                tts_queue.put(("response_end", turn_id))
 
             messages = request_messages + [{"role": "assistant", "content": answer}]
             if len(messages) > 21:
@@ -1041,18 +1022,22 @@ def ollama_worker():
 
             chat_result_queue.put((
                 "done",
-                (answer, chunks, time.monotonic() - started),
+                (turn_id, answer, chunks, time.monotonic() - started),
             ))
 
         except Exception as error:
+            if TTS_STREAMING_ENABLED:
+                # Drop queued partial speech after an interrupted/failed response.
+                clear_tts_queue()
+                tts_queue.put(("response_end", turn_id))
             if cancel_event.is_set():
-                chat_result_queue.put(("cancelled", "پاسخ هوش مصنوعی لغو شد."))
+                chat_result_queue.put(("cancelled", turn_id))
             else:
                 detail = f"{type(error).__name__}: {error}"
                 if isinstance(error, urllib.error.URLError):
                     detail += " | Ollama local URL: " + OLLAMA_URL
                     detail += " | Localhost proxy bypass is enabled."
-                chat_result_queue.put(("error", detail))
+                chat_result_queue.put(("error", (turn_id, detail)))
 
 
 def submit_text(value, state, history):
@@ -1061,28 +1046,30 @@ def submit_text(value, state, history):
     if not value:
         return False
 
-    if state["ai_busy"]:
+    if state["ai_busy"] or state.get("asr_pending", False):
         return False
 
     timestamp = datetime.now().strftime("%H:%M:%S")
-    history.append((timestamp, f"شما: {value}"))
+    history.append((timestamp, f"You: {value}"))
 
     # Save accepted typed and recognized messages.
     try:
         with OUTPUT_FILE.open("a", encoding="utf-8") as file:
             file.write(f"[{timestamp}] {value}\n")
     except OSError as error:
-        history.append((timestamp, f"Save error: {error}"))
+        state["message"] = f"Could not save transcript: {error}"
 
     cancel_event.clear()
+    state["turn_id"] = state.get("turn_id", 0) + 1
     state["ai_busy"] = True
-    state["ai_status"] = "Waiting for Ollama"
-    state["stream_text"] = ""
-    state["stream_raw_text"] = ""
-    state["stream_chunks"] = 0
-    state["stream_started"] = time.monotonic()
+    state["assistant_done"] = False
+    state["waiting_for_tts"] = False
+    state["asr_pending"] = False
+    state["status"] = "Thinking"
     state["scroll_offset"] = 0
-    chat_queue.put(value)
+    mic_paused.set()
+    clear_audio_queue()
+    chat_queue.put((value, state["turn_id"]))
     return True
 
 
@@ -1093,53 +1080,29 @@ def process_chat_results(state, history):
         except queue.Empty:
             break
 
-        if kind == "start":
-            state["ai_busy"] = True
-            state["ai_status"] = "Generating response"
-            state["stream_text"] = ""
-            state["stream_raw_text"] = ""
-            state["stream_chunks"] = 0
-
-        elif kind == "chunk":
-            piece, count, elapsed = value
-            state["stream_raw_text"] += piece
-            state["stream_text"] = clean_model_output(
-                state["stream_raw_text"], streaming=True
-            )
-            state["stream_chunks"] = count
-            rate = count / max(elapsed, 0.001)
-            state["ai_status"] = f"Streaming | {rate:.1f} chunks/s"
-
-        elif kind == "done":
-            answer, count, elapsed = value
+        if kind == "done":
+            turn_id, answer, count, elapsed = value
+            if turn_id != state.get("turn_id"):
+                continue
             timestamp = datetime.now().strftime("%H:%M:%S")
             history.append((timestamp, f"Qwen: {answer}"))
-            state["ai_busy"] = False
-            state["ai_status"] = f"Completed | {elapsed:.1f}s"
-            state["stream_text"] = ""
-            state["stream_raw_text"] = ""
             state["scroll_offset"] = 0
-
+            state["assistant_done"] = True
+            finish_turn_if_ready(state, turn_id)
 
         elif kind == "cancelled":
-            history.append((datetime.now().strftime("%H:%M:%S"), value))
-            state["ai_busy"] = False
-            state["ai_status"] = "Cancelled"
-            state["stream_text"] = ""
-            state["stream_raw_text"] = ""
-            state["stream_chunks"] = 0
-            state["scroll_offset"] = 0
+            if value != state.get("turn_id"):
+                continue
+            state["assistant_done"] = True
+            finish_turn_if_ready(state, value)
 
         elif kind == "error":
-            history.append((
-                datetime.now().strftime("%H:%M:%S"),
-                f"Ollama error: {value}",
-            ))
-            state["ai_busy"] = False
-            state["ai_status"] = "Ollama error"
-            state["stream_text"] = ""
-            state["stream_raw_text"] = ""
-            state["message"] = value
+            turn_id, detail = value
+            if turn_id != state.get("turn_id"):
+                continue
+            state["message"] = detail
+            state["assistant_done"] = True
+            finish_turn_if_ready(state, turn_id)
 
 
 # ============================================================
@@ -1154,36 +1117,36 @@ def process_results(state, history):
             break
 
         if kind == "error":
-            state["status"] = "Recognition error"
             state["message"] = text
+            state["active_id"] = None
+            state["speaking"] = False
+            state["asr_pending"] = False
+            state["status"] = "Listening"
+            mic_paused.clear()
+            clear_audio_queue()
             continue
 
         if kind == "partial":
-            if uid == state["active_id"] and text:
-                state["partial_text"] = text
-                state["status"] = "Live transcription"
+            # Partial hypotheses are intentionally hidden to keep chat stable.
             continue
 
         if kind == "final":
+            state["asr_pending"] = False
             if text:
-                # Submit recognized speech through the shared chat path.
-                if state["ai_busy"]:
-                    timestamp = datetime.now().strftime("%H:%M:%S")
-                    history.append((timestamp, f"شما: {text}"))
-                    with OUTPUT_FILE.open("a", encoding="utf-8") as file:
-                        file.write(f"[{timestamp}] {text}\n")
-                    history.append((timestamp, "سیستم: Qwen مشغول بود؛ گفتار ارسال نشد."))
-                else:
-                    submit_text(text, state, history)
+                submit_text(text, state, history)
 
                 state["last_rtf"] = elapsed / duration if duration else 0
                 state["last_inference"] = elapsed
+            else:
+                # Empty recognition must not leave the microphone locked.
+                mic_paused.clear()
 
             if state["active_id"] == uid:
                 state["active_id"] = None
                 state["partial_text"] = ""
                 state["speaking"] = False
-                state["status"] = "Listening"
+                if not state["ai_busy"]:
+                    state["status"] = "Listening"
 
 
 # ============================================================
@@ -1375,8 +1338,6 @@ def main():
         pass
 
     console.print("[cyan]Loading Shenava...[/cyan]")
-    console.print("[dim]Ollama localhost traffic bypasses system proxies.[/dim]")
-    console.print(f"[dim]Chat model: {model_display_name()}[/dim]")
     recognizer = load_model()
 
     tts_voice = None
@@ -1413,15 +1374,14 @@ def main():
         "last_inference": 0.0,
         "scroll_offset": 0,
         "ai_busy": False,
-        "ai_status": check_ollama_connection(),
-        "stream_text": "",
-        "stream_raw_text": "",
-        "stream_chunks": 0,
-        "stream_started": 0.0,
+        "turn_id": 0,
+        "assistant_done": False,
+        "waiting_for_tts": False,
+        "tts_completed_turn": 0,
+        "asr_pending": False,
         "input_text": "",
         "input_cursor": 0,
         "tts_enabled": tts_thread is not None,
-        "tts_status": "Ready" if tts_thread else "Disabled",
     }
 
     asr_thread = threading.Thread(
@@ -1490,10 +1450,6 @@ def main():
                         process_chat_results(state, history)
                         process_tts_results(state, history)
 
-                        if state["ai_busy"] and not state["stream_chunks"]:
-                            waited = time.monotonic() - state["stream_started"]
-                            state["ai_status"] = f"Waiting for first token | {waited:.1f}s"
-
                         key = read_key()
                         current_input = state["input_text"]
 
@@ -1535,7 +1491,6 @@ def main():
                         elif key == "esc":
                             if state["ai_busy"]:
                                 cancel_event.set()
-                                state["ai_status"] = "Cancelling..."
 
                         elif key == "up":
                             state["scroll_offset"] += 1
@@ -1547,37 +1502,6 @@ def main():
                             state["scroll_offset"] = max(
                                 0, state["scroll_offset"] - max(1, console.height - 20)
                             )
-                        # Commands are active only when the text field is empty.
-                        elif not current_input and key == "x":
-                            if state["ai_busy"]:
-                                cancel_event.set()
-                        elif not current_input and key == "c":
-                            final = segmenter.finish()
-                            if final:
-                                asr_queue.put(("final", *final))
-
-                            state["speaking"] = False
-                            state["partial_text"] = ""
-                            state["status"] = "Calibrating — stay silent"
-                            clear_audio_queue()
-
-                            noise, threshold = calibrate_noise(
-                                input_rate, calibration_progress
-                            )
-                            segmenter.set_noise(noise, threshold)
-                            state["noise_floor"] = noise
-                            state["threshold"] = threshold
-                            state["calibrated"] = True
-                            state["status"] = "Listening"
-                            clear_audio_queue()
-                            continue
-                        elif not current_input and key == "d":
-                            segmenter.set_noise(MIN_FRAME_RMS, MIN_FRAME_RMS, adaptive=False)
-                            state["noise_floor"] = MIN_FRAME_RMS
-                            state["threshold"] = MIN_FRAME_RMS
-                            state["calibrated"] = False
-                            state["status"] = "Listening"
-                            clear_audio_queue()
                         elif not current_input and key == "q":
                             break
 
@@ -1609,15 +1533,16 @@ def main():
                             state["active_id"] = uid
                             state["speaking"] = True
                             state["partial_text"] = ""
-                            state["status"] = "Speech detected"
 
                         elif event == "partial":
                             state["speaking"] = True
-                            if asr_queue.qsize() < 3:
-                                asr_queue.put_nowait(("partial", uid, audio))
 
                         elif event == "final":
-                            state["status"] = "Finalizing"
+                            # Freeze the microphone before final ASR begins.
+                            mic_paused.set()
+                            clear_audio_queue()
+                            state["asr_pending"] = True
+                            state["status"] = "Processing"
                             state["speaking"] = False
                             state["silence_ms"] = 0
                             asr_queue.put(("final", uid, audio))
