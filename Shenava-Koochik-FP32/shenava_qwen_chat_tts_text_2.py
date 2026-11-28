@@ -66,7 +66,9 @@ OLLAMA_TIMEOUT = 300
 OLLAMA_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 SYSTEM_PROMPT = (
-    "طبیعی، دقیق و کوتاه پاسخ بده."
+    "طبیعی، دقیق و کوتاه پاسخ بده. فقط متن ساده تولید کن. "
+    "هرگز از ایموجی، صورتک متنی، تصویر، نشانه‌گذاری تصویر Markdown، "
+    "تگ HTML تصویر یا لینک تصویر استفاده نکن؛ فقط پاسخ متنی بده."
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -113,7 +115,7 @@ INPUT_DEVICE = None
 AUDIO_QUEUE_SIZE = 500
 VISIBLE_HISTORY = 50
 
-console = Console(highlight=False, soft_wrap=True)
+console = Console(highlight=False, soft_wrap=True, emoji=False)
 
 audio_queue = queue.Queue(maxsize=AUDIO_QUEUE_SIZE)
 asr_queue = queue.Queue()
@@ -137,6 +139,55 @@ audio_status = [""]
 def rtl(value):
     """Keep original letters and tell the terminal this line is RTL."""
     return "\u200f" + str(value) if value is not None else ""
+
+
+# Remove visual-only content from model output; keep ordinary text untouched.
+_EMOJI_RE = re.compile(
+    "[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF"
+    "\uFE0E\uFE0F\u200D\u20E3\U0001F3FB-\U0001F3FF]"
+)
+_TEXT_EMOTICON_RE = re.compile(
+    r"(?<!\w)(?:[:;=8xX][-^']?[)(/DPp]|<3|¯\\_\(ツ\)_/¯)(?!\w)"
+)
+
+
+def clean_model_output(value, streaming=False):
+    """Strip emoji, emoticons and image markup from assistant text."""
+    text = str(value or "")
+
+    # Do not expose unfinished image syntax while tokens are still arriving.
+    if streaming:
+        lower = text.lower()
+        open_markers = [
+            (lower.rfind("!["), ")"),
+            (lower.rfind("<img"), ">"),
+            (lower.rfind("<svg"), "</svg>"),
+            (lower.rfind("<picture"), "</picture>"),
+            (lower.rfind("<figure"), "</figure>"),
+        ]
+        for position, closing in open_markers:
+            if position >= 0 and closing not in lower[position:]:
+                text = text[:position]
+                lower = text.lower()
+
+    # Markdown images, HTML image containers, and embedded image data.
+    text = re.sub(r"!\[[^\]]*\]\[[^\]]*\]", " ", text)
+    text = re.sub(r"!\[[^\]]*\]\((?:[^()]|\([^()]*\))*\)", " ", text)
+    text = re.sub(r"!\[[^\]]*\](?!\()", " ", text)
+    text = re.sub(r"<img\b[^>]*?/?>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<(picture|figure|svg)\b.*?</\1\s*>", " ", text,
+                  flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+", " ", text)
+    text = re.sub(
+        r"https?://[^\s)]+\.(?:png|jpe?g|gif|webp|svg)(?:\?[^\s)]*)?",
+        " ", text, flags=re.IGNORECASE,
+    )
+
+    # Unicode emoji and common ASCII-style faces.
+    text = _EMOJI_RE.sub("", text)
+    text = _TEXT_EMOTICON_RE.sub("", text)
+    text = re.sub(r"(?<!\w):[a-z0-9_+-]{2,}:(?!\w)", "", text, flags=re.IGNORECASE)
+    return text.strip()
 
 
 def ltr(value):
@@ -272,12 +323,8 @@ def make_layout(state, history):
 
     for timestamp, message in history:
         transcript.append((ltr(f"  {timestamp}"), "dim", False))
-        # Keep the English Qwen role marker at the far right of its chat entry.
-        if message.startswith("Qwen: "):
-            transcript.append((ltr("Qwen:"), "bold bright_cyan", "right_ltr"))
-            append_rtl_lines(transcript, message[6:], width, "white")
-        else:
-            append_rtl_lines(transcript, message, width, "white")
+        # The model ID is part of the first response line, not a separate row.
+        append_rtl_lines(transcript, message, width, "white")
 
     if state["speaking"]:
         transcript.append((ltr("LIVE PREVIEW"), "bold yellow", False))
@@ -285,9 +332,10 @@ def make_layout(state, history):
         append_rtl_lines(transcript, preview, width, "bold bright_white")
 
     if state["ai_busy"]:
-        transcript.append((ltr("QWEN STREAMING"), "bold bright_cyan", "right_ltr"))
         stream = state["stream_text"] or "در انتظار پاسخ..."
-        append_rtl_lines(transcript, stream, width, "bright_white")
+        append_rtl_lines(
+            transcript, f"Qwen: {stream}", width, "bright_white"
+        )
 
     if not transcript:
         transcript.append((rtl("هنوز پیامی ثبت نشده است."), "dim", True))
@@ -485,6 +533,7 @@ def load_tts_model():
 
 
 def clean_text_for_tts(value):
+    value = clean_model_output(value, streaming=True)
     value = re.sub(r"```.*?```", " ", value, flags=re.DOTALL)
     value = re.sub(r"`([^`]*)`", r"\1", value)
     value = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", value)
@@ -978,7 +1027,7 @@ def ollama_worker():
                 chat_result_queue.put(("cancelled", "پاسخ هوش مصنوعی لغو شد."))
                 continue
 
-            answer = "".join(parts).strip()
+            answer = clean_model_output("".join(parts)).strip()
             if not answer:
                 raise RuntimeError("Ollama returned an empty response.")
 
@@ -1029,6 +1078,7 @@ def submit_text(value, state, history):
     state["ai_busy"] = True
     state["ai_status"] = "Waiting for Ollama"
     state["stream_text"] = ""
+    state["stream_raw_text"] = ""
     state["stream_chunks"] = 0
     state["stream_started"] = time.monotonic()
     state["scroll_offset"] = 0
@@ -1047,11 +1097,15 @@ def process_chat_results(state, history):
             state["ai_busy"] = True
             state["ai_status"] = "Generating response"
             state["stream_text"] = ""
+            state["stream_raw_text"] = ""
             state["stream_chunks"] = 0
 
         elif kind == "chunk":
             piece, count, elapsed = value
-            state["stream_text"] += piece
+            state["stream_raw_text"] += piece
+            state["stream_text"] = clean_model_output(
+                state["stream_raw_text"], streaming=True
+            )
             state["stream_chunks"] = count
             rate = count / max(elapsed, 0.001)
             state["ai_status"] = f"Streaming | {rate:.1f} chunks/s"
@@ -1063,6 +1117,7 @@ def process_chat_results(state, history):
             state["ai_busy"] = False
             state["ai_status"] = f"Completed | {elapsed:.1f}s"
             state["stream_text"] = ""
+            state["stream_raw_text"] = ""
             state["scroll_offset"] = 0
 
 
@@ -1071,6 +1126,7 @@ def process_chat_results(state, history):
             state["ai_busy"] = False
             state["ai_status"] = "Cancelled"
             state["stream_text"] = ""
+            state["stream_raw_text"] = ""
             state["stream_chunks"] = 0
             state["scroll_offset"] = 0
 
@@ -1082,6 +1138,7 @@ def process_chat_results(state, history):
             state["ai_busy"] = False
             state["ai_status"] = "Ollama error"
             state["stream_text"] = ""
+            state["stream_raw_text"] = ""
             state["message"] = value
 
 
@@ -1358,6 +1415,7 @@ def main():
         "ai_busy": False,
         "ai_status": check_ollama_connection(),
         "stream_text": "",
+        "stream_raw_text": "",
         "stream_chunks": 0,
         "stream_started": 0.0,
         "input_text": "",
