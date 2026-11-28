@@ -80,8 +80,7 @@ OUTPUT_FILE = BASE_DIR / "transcriptions.txt"
 TTS_MODEL_FILE = BASE_DIR / "models" / "fa_IR-ganji-medium.onnx"
 TTS_OUTPUT_DEVICE = None
 TTS_ENABLED_BY_DEFAULT = True
-TTS_QUEUE_SIZE = 0  # 0 = unbounded queue for streamed speech
-TTS_STREAM_WORDS = 3  # Speak after 3 complete words, or earlier at punctuation
+TTS_QUEUE_SIZE = 0  # Unbounded queue for complete assistant replies
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
@@ -123,7 +122,6 @@ result_queue = queue.Queue()
 chat_queue = queue.Queue()
 chat_result_queue = queue.Queue()
 tts_queue = queue.Queue(maxsize=TTS_QUEUE_SIZE)
-TTS_STREAMING_ENABLED = False
 tts_result_queue = queue.Queue()
 cancel_event = threading.Event()
 tts_playing = threading.Event()
@@ -494,56 +492,6 @@ def clean_text_for_tts(value):
     value = re.sub(r"(?m)^\s*[-*+]\s+", "", value)
     value = re.sub(r"[*_#>`~]", "", value)
     return re.sub(r"\s+", " ", value).strip()
-
-
-class StreamingSpeechBuffer:
-    """Turn incoming model tokens into short, pronounceable TTS phrases."""
-
-    def __init__(self, words_per_chunk=3):
-        self.words_per_chunk = max(2, int(words_per_chunk))
-        self.buffer = ""
-
-    def feed(self, piece="", final=False):
-        self.buffer += str(piece or "")
-        ready = []
-
-        while self.buffer.strip():
-            # Prefer natural pauses when punctuation arrives.
-            punctuation = re.search(r"[.!?؟؛،:\n]", self.buffer)
-            if punctuation:
-                end = punctuation.end()
-                phrase = self.buffer[:end]
-                word_count = len(re.findall(r"\S+", phrase))
-                strong_pause = punctuation.group(0) in ".!?؟؛;:\n"
-                if word_count >= 2 or strong_pause:
-                    cleaned = clean_text_for_tts(phrase)
-                    if cleaned:
-                        ready.append(cleaned)
-                    self.buffer = self.buffer[end:]
-                    continue
-
-            # Without punctuation, release a few complete words at a time.
-            words = list(re.finditer(r"\S+", self.buffer))
-            count = self.words_per_chunk
-            if len(words) >= count:
-                end = words[count - 1].end()
-                # Wait for whitespace after the last word so tokens are not cut.
-                if end < len(self.buffer) and self.buffer[end].isspace():
-                    cleaned = clean_text_for_tts(self.buffer[:end])
-                    if cleaned:
-                        ready.append(cleaned)
-                    self.buffer = self.buffer[end:]
-                    continue
-
-            break
-
-        if final and self.buffer.strip():
-            cleaned = clean_text_for_tts(self.buffer)
-            if cleaned:
-                ready.append(cleaned)
-            self.buffer = ""
-
-        return ready
 
 
 def play_tts_audio(audio, sample_rate):
@@ -939,6 +887,7 @@ def check_ollama_connection():
 
 
 def ollama_worker():
+    """Generate complete assistant replies; playback is scheduled by the UI thread."""
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     while True:
@@ -960,15 +909,15 @@ def ollama_worker():
         }
 
         parts = []
-        speech_buffer = StreamingSpeechBuffer(words_per_chunk=TTS_STREAM_WORDS)
         started = time.monotonic()
-        chunks = 0
-
         try:
             request = urllib.request.Request(
                 OLLAMA_URL,
                 data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                headers={"Content-Type": "application/json", "Accept": "application/x-ndjson"},
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/x-ndjson",
+                },
                 method="POST",
             )
             with OLLAMA_OPENER.open(request, timeout=OLLAMA_TIMEOUT) as response:
@@ -989,11 +938,6 @@ def ollama_worker():
                     piece = packet.get("message", {}).get("content", "")
                     if piece:
                         parts.append(piece)
-                        chunks += 1
-                        # Start Piper while Qwen is still generating its answer.
-                        if TTS_STREAMING_ENABLED and not cancel_event.is_set():
-                            for phrase in speech_buffer.feed(piece):
-                                tts_queue.put(phrase)
 
                     if packet.get("error"):
                         raise RuntimeError(packet["error"])
@@ -1001,9 +945,6 @@ def ollama_worker():
                         break
 
             if cancel_event.is_set():
-                if TTS_STREAMING_ENABLED:
-                    clear_tts_queue()
-                    tts_queue.put(("response_end", turn_id))
                 chat_result_queue.put(("cancelled", turn_id))
                 continue
 
@@ -1011,25 +952,16 @@ def ollama_worker():
             if not answer:
                 raise RuntimeError("Ollama returned an empty response.")
 
-            if TTS_STREAMING_ENABLED:
-                for phrase in speech_buffer.feed(final=True):
-                    tts_queue.put(phrase)
-                tts_queue.put(("response_end", turn_id))
-
             messages = request_messages + [{"role": "assistant", "content": answer}]
             if len(messages) > 21:
                 messages = [messages[0]] + messages[-20:]
 
             chat_result_queue.put((
                 "done",
-                (turn_id, answer, chunks, time.monotonic() - started),
+                (turn_id, answer, time.monotonic() - started),
             ))
 
         except Exception as error:
-            if TTS_STREAMING_ENABLED:
-                # Drop queued partial speech after an interrupted/failed response.
-                clear_tts_queue()
-                tts_queue.put(("response_end", turn_id))
             if cancel_event.is_set():
                 chat_result_queue.put(("cancelled", turn_id))
             else:
@@ -1038,7 +970,6 @@ def ollama_worker():
                     detail += " | Ollama local URL: " + OLLAMA_URL
                     detail += " | Localhost proxy bypass is enabled."
                 chat_result_queue.put(("error", (turn_id, detail)))
-
 
 def submit_text(value, state, history):
     """Send typed or recognized text through the same chat queue."""
@@ -1081,19 +1012,28 @@ def process_chat_results(state, history):
             break
 
         if kind == "done":
-            turn_id, answer, count, elapsed = value
+            turn_id, answer, elapsed = value
             if turn_id != state.get("turn_id"):
                 continue
+
             timestamp = datetime.now().strftime("%H:%M:%S")
             history.append((timestamp, f"Qwen: {answer}"))
             state["scroll_offset"] = 0
             state["assistant_done"] = True
-            finish_turn_if_ready(state, turn_id)
+
+            # The full answer is rendered first; Piper is queued after the UI refresh.
+            if state.get("tts_enabled"):
+                state["tts_pending"] = (turn_id, answer)
+                state["status"] = "Preparing speech"
+                state["waiting_for_tts"] = True
+            else:
+                finish_turn_if_ready(state, turn_id)
 
         elif kind == "cancelled":
             if value != state.get("turn_id"):
                 continue
             state["assistant_done"] = True
+            state["tts_completed_turn"] = value
             finish_turn_if_ready(state, value)
 
         elif kind == "error":
@@ -1102,7 +1042,23 @@ def process_chat_results(state, history):
                 continue
             state["message"] = detail
             state["assistant_done"] = True
+            state["tts_completed_turn"] = turn_id
             finish_turn_if_ready(state, turn_id)
+
+
+def enqueue_pending_tts_after_render(state):
+    """Queue the complete answer only after its final text is drawn on screen."""
+    pending = state.pop("tts_pending", None)
+    if not pending:
+        return
+
+    turn_id, answer = pending
+    if turn_id != state.get("turn_id") or not state.get("tts_enabled"):
+        return
+
+    # Queue order guarantees response_done arrives after all audio is played.
+    tts_queue.put(answer)
+    tts_queue.put(("response_end", turn_id))
 
 
 # ============================================================
@@ -1304,7 +1260,7 @@ def list_microphones():
 # ============================================================
 
 def main():
-    global OLLAMA_URL, OLLAMA_MODEL, OLLAMA_OPENER, TTS_STREAMING_ENABLED
+    global OLLAMA_URL, OLLAMA_MODEL, OLLAMA_OPENER
     parser = argparse.ArgumentParser(description="Shenava Persian voice/text chat")
     parser.add_argument("--device", type=int, default=INPUT_DEVICE)
     parser.add_argument("--list-devices", action="store_true")
@@ -1350,7 +1306,6 @@ def main():
                 daemon=True, name="Piper-TTS",
             )
             tts_thread.start()
-            TTS_STREAMING_ENABLED = True
 
     device = sd.query_devices(args.device, "input")
     input_rate = int(round(device["default_samplerate"]))
@@ -1382,6 +1337,7 @@ def main():
         "input_text": "",
         "input_cursor": 0,
         "tts_enabled": tts_thread is not None,
+        "tts_pending": None,
     }
 
     asr_thread = threading.Thread(
@@ -1519,6 +1475,7 @@ def main():
                             block = audio_queue.get(timeout=0.05)
                         except queue.Empty:
                             live.update(make_layout(state, history))
+                            enqueue_pending_tts_after_render(state)
                             continue
 
                         event, uid, audio = segmenter.push(block)
@@ -1555,6 +1512,7 @@ def main():
                             state["status"] = "Listening"
 
                         live.update(make_layout(state, history))
+                        enqueue_pending_tts_after_render(state)
 
             except KeyboardInterrupt:
                 state["status"] = "Stopping"
